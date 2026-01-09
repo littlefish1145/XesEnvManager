@@ -1,0 +1,2 @@
+# XesEnvManager
+使用Golang编写，通过覆写Xes自带Python实现使用本地Python
