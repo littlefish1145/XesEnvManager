@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package pythonmanager;
+
+option go_package = "./proto";
+
+// PythonEnvironment represents a Python environment
+message PythonEnvironment {
+  string name = 1;
+  string path = 2;
+  string version = 3;
+  bool enabled = 4;
+  string encoding = 5;
+  string platform = 6; // wsl or windows
+}
+
+// Request to search for Python environments
+message SearchEnvironmentsRequest {
+}
+
+// Response containing Python environments
+message SearchEnvironmentsResponse {
+  repeated PythonEnvironment environments = 1;
+}
+
+// Request to execute a Python script
+message ExecutePythonRequest {
+  string python_path = 1;
+  repeated string arguments = 2;
+  bool capture_output = 3;
+  bool auto_exit = 4;
+  bool interactive = 5; // Whether the script requires interactive input
+  string input_data = 6; // Input data to provide to the script
+}
+
+// Response from executing a Python script
+message ExecutePythonResponse {
+  int32 exit_code = 1;
+  string output = 2;
+  string error = 3;
+}
+
+// Service definition for Python management
+service PythonService {
+  rpc SearchEnvironments(SearchEnvironmentsRequest) returns (SearchEnvironmentsResponse);
+  rpc ExecutePython(ExecutePythonRequest) returns (ExecutePythonResponse);
+}
