@@ -8,17 +8,25 @@
 ```powershell
 ./python.exe -l 
 ```
-生成配置文件
+生成配置文件          
 5.修改配置文件指定python          
 Enjoy!
 # WSL Support
-1.下载WSL服务器
-2.在wsl终端启动服务器
-3.在xes安装目录打开终端，输入      
+1.下载WSL服务器           
+2.在wsl终端启动服务器        
+3.在xes安装目录打开终端，输入       
 ```powershell
 ./python.exe -l 
 ```
-更新配置文件
+更新配置文件       
 4.修改配置文件指定Python
-# 开发
-None,不想写了
+# build 
+确保你的环境安装了make,Go          
+```powershell
+go mod tidy
+```
+安装依赖
+```powershell
+make build-all
+```
+构建二进制文件
