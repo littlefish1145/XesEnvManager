@@ -425,23 +425,22 @@ func (e *PythonExecutor) GetLastError() string {
 	return e.lastError
 }
 
-// detectMissingModules detects missing modules from error output
-func (e *PythonExecutor) detectMissingModules(errorOutput string) []string {
-	var missingModules []string
-
-	// Common module missing error patterns
-	patterns := []*regexp.Regexp{
-		// Python standard error: ModuleNotFoundError: No module named 'module_name'
+var (
+	// Pre-compiled regex patterns for performance
+	missingModulePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`ModuleNotFoundError:\s*No\s+module\s+named\s+['"]([^'"]+)['"]`),
-		// ImportError: No module named 'module_name'
 		regexp.MustCompile(`ImportError:\s*No\s+module\s+named\s+['"]([^'"]+)['"]`),
-		// pip install error: ERROR: Could not find a version that satisfies the requirement module_name
 		regexp.MustCompile(`ERROR:\s*Could\s+not\s+find\s+a\s+version\s+that\s+satisfies\s+the\s+requirement\s+(\S+)`),
-		// Simple module name pattern
 		regexp.MustCompile(`['"]([^'"]+)['"]\s+(?:module|package)\s+(?:not\s+found|is\s+not\s+installed)`),
 	}
+)
 
-	for _, pattern := range patterns {
+// detectMissingModules detects missing modules from error output
+func (e *PythonExecutor) detectMissingModules(errorOutput string) []string {
+	missingModulesMap := make(map[string]bool)
+	var missingModules []string
+
+	for _, pattern := range missingModulePatterns {
 		matches := pattern.FindAllStringSubmatch(errorOutput, -1)
 		for _, match := range matches {
 			if len(match) > 1 {
@@ -450,7 +449,8 @@ func (e *PythonExecutor) detectMissingModules(errorOutput string) []string {
 				// Filter out some obviously non-module name results
 				if moduleName != "" &&
 					!strings.Contains(moduleName, " ") &&
-					!containsString(missingModules, moduleName) {
+					!missingModulesMap[moduleName] {
+					missingModulesMap[moduleName] = true
 					missingModules = append(missingModules, moduleName)
 				}
 			}
@@ -463,41 +463,88 @@ func (e *PythonExecutor) detectMissingModules(errorOutput string) []string {
 // installMissingModules installs missing modules
 func (e *PythonExecutor) installMissingModules(modules []string) bool {
 	if len(modules) == 0 {
-		return true
+		// Even if no modules detected, we might want to allow manual input if we are here
+		// But usually this is called when modules ARE detected.
 	}
 
-	fmt.Println("\nDetected missing Python modules:")
+	fmt.Println("\n检测到缺失的 Python 模块:")
 	for _, module := range modules {
 		fmt.Printf("  - %s\n", module)
 	}
 
-	fmt.Println("\nPress Enter to automatically install these modules, or click 'Stop' button to cancel...")
-	fmt.Scanln() // Wait for user input
+	fmt.Println("\n直接按 Enter 安装以上模块，或者输入额外的包名（多个包用空格分隔）后按 Enter:")
+	
+	scanner := bufio.NewScanner(os.Stdin)
+	var input string
+	if scanner.Scan() {
+		input = strings.TrimSpace(scanner.Text())
+	}
 
+	finalModules := modules
+	if input != "" {
+		// If user entered something, add those to the list
+		extraModules := strings.Fields(input)
+		for _, m := range extraModules {
+			if !containsString(finalModules, m) {
+				finalModules = append(finalModules, m)
+			}
+		}
+	}
+
+	if len(finalModules) == 0 {
+		fmt.Println("未指定要安装的模块。")
+		return false
+	}
+
+	return e.runPipInstall(finalModules)
+}
+
+// runPipInstall executes the pip install command
+func (e *PythonExecutor) runPipInstall(modules []string) bool {
 	// Build pip install command
 	pipArgs := []string{"-m", "pip", "install"}
 	pipArgs = append(pipArgs, modules...)
 
 	// Create command
 	cmd := exec.Command(e.pythonPath, pipArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	fmt.Println("\nInstalling modules, please wait...")
-	fmt.Printf("Executing command: %s %s\n", e.pythonPath, strings.Join(pipArgs, " "))
+	fmt.Println("\n正在安装模块，请稍候...")
+	fmt.Printf("执行命令: %s %s\n", e.pythonPath, strings.Join(pipArgs, " "))
 	fmt.Println("----------------------------------------")
 
 	// Execute pip install command
-	output, err := cmd.CombinedOutput()
+	err := cmd.Run()
 
 	fmt.Println("----------------------------------------")
 
 	if err != nil {
-		fmt.Printf("Module installation failed: %v\n", err)
-		fmt.Println("Please manually run the following command to install modules:")
+		fmt.Printf("模块安装失败: %v\n", err)
+		fmt.Println("是否尝试手动输入包名重新安装？(y/n)")
+		
+		scanner := bufio.NewScanner(os.Stdin)
+		var retry string
+		if scanner.Scan() {
+			retry = strings.TrimSpace(scanner.Text())
+		}
+
+		if strings.ToLower(retry) == "y" {
+			fmt.Println("请输入要安装的包名 (多个包用空格分隔):")
+			if scanner.Scan() {
+				manualInput := strings.TrimSpace(scanner.Text())
+				if manualInput != "" {
+					return e.runPipInstall(strings.Fields(manualInput))
+				}
+			}
+		}
+		
+		fmt.Println("请手动运行以下命令安装模块:")
 		fmt.Printf("%s %s\n", e.pythonPath, strings.Join(pipArgs, " "))
 		return false
 	} else {
-		fmt.Println("Modules installed successfully!")
-		fmt.Println(string(output))
+		fmt.Println("模块安装成功!")
 		return true
 	}
 }

@@ -20,12 +20,14 @@ type PythonConfig struct {
 	configFilePath         string
 	pythonEnvironments     []model.PythonEnvironment
 	currentEnvironmentName string
+	DisableUpdateCheck     bool
 }
 
 // NewPythonConfig creates a new PythonConfig instance
 func NewPythonConfig(configPath string) *PythonConfig {
 	config := &PythonConfig{
 		currentEnvironmentName: "system",
+		DisableUpdateCheck:     false,
 	}
 
 	if configPath == "" {
@@ -87,8 +89,9 @@ func (c *PythonConfig) parseConfigFile(filePath string) bool {
 	}
 
 	var configData struct {
-		CurrentEnvironment string              `json:"current_environment"`
+		CurrentEnvironment string                    `json:"current_environment"`
 		Environments       []model.PythonEnvironment `json:"environments"`
+		DisableUpdateCheck bool                      `json:"disable_update_check"`
 	}
 
 	if err := json.Unmarshal(data, &configData); err != nil {
@@ -101,6 +104,7 @@ func (c *PythonConfig) parseConfigFile(filePath string) bool {
 	}
 
 	c.pythonEnvironments = configData.Environments
+	c.DisableUpdateCheck = configData.DisableUpdateCheck
 
 	return true
 }
@@ -108,11 +112,13 @@ func (c *PythonConfig) parseConfigFile(filePath string) bool {
 // saveConfigFile saves the config to JSON file
 func (c *PythonConfig) saveConfigFile(filePath string) bool {
 	configData := struct {
-		CurrentEnvironment string              `json:"current_environment"`
+		CurrentEnvironment string                    `json:"current_environment"`
 		Environments       []model.PythonEnvironment `json:"environments"`
+		DisableUpdateCheck bool                      `json:"disable_update_check"`
 	}{
 		CurrentEnvironment: c.currentEnvironmentName,
 		Environments:       c.pythonEnvironments,
+		DisableUpdateCheck: c.DisableUpdateCheck,
 	}
 
 	data, err := json.MarshalIndent(configData, "", "  ")
@@ -414,35 +420,38 @@ func (c *PythonConfig) findVenvEnvironments() []string {
 
 // SearchPythonEnvironments searches all available Python environments
 func (c *PythonConfig) SearchPythonEnvironments() {
+	// Cache existing versions to avoid re-running python --version
+	versionCache := make(map[string]string)
+	for _, env := range c.pythonEnvironments {
+		if env.Version != "" {
+			versionCache[env.Path] = env.Version
+		}
+	}
+
 	c.pythonEnvironments = nil
 
 	// Used to avoid duplicate paths
-	var processedPaths []string
-
-	// Helper function to check if path is already processed
-	isPathProcessed := func(path string) bool {
-		for _, processedPath := range processedPaths {
-			if processedPath == path {
-				return true
-			}
-		}
-		return false
-	}
+	processedPaths := make(map[string]bool)
 
 	// Helper function to add environment if path is not duplicate
 	addEnvironmentIfUnique := func(name, path string, enabled bool, platform string) {
-		if path != "" && !isPathProcessed(path) {
+		if path != "" && !processedPaths[path] {
+			version := versionCache[path]
+			if version == "" {
+				version = c.GetPythonVersion(path)
+			}
+
 			env := model.PythonEnvironment{
 				Name:     name,
 				Path:     path,
-				Version:  c.GetPythonVersion(path),
+				Version:  version,
 				Enabled:  enabled,
 				Encoding: "utf-8",
 				Platform: platform,
 			}
 
 			c.pythonEnvironments = append(c.pythonEnvironments, env)
-			processedPaths = append(processedPaths, path)
+			processedPaths[path] = true
 		}
 	}
 
@@ -476,10 +485,10 @@ func (c *PythonConfig) SearchPythonEnvironments() {
 		if err == nil {
 			for _, env := range wslEnvironments {
 				// Check if this path is already processed to avoid duplicates
-				if !isPathProcessed(env.Path) {
+				if !processedPaths[env.Path] {
 					env.Platform = "wsl"
 					c.pythonEnvironments = append(c.pythonEnvironments, env)
-					processedPaths = append(processedPaths, env.Path)
+					processedPaths[env.Path] = true
 				}
 			}
 		}
@@ -515,6 +524,17 @@ func (c *PythonConfig) SearchWSLEnvironments() ([]model.PythonEnvironment, error
 	}
 
 	return environments, nil
+}
+
+// SetDisableUpdateCheck sets the update check preference
+func (c *PythonConfig) SetDisableUpdateCheck(disabled bool) bool {
+	c.DisableUpdateCheck = disabled
+	return c.saveConfigFile(c.configFilePath)
+}
+
+// GetDisableUpdateCheck returns the update check preference
+func (c *PythonConfig) GetDisableUpdateCheck() bool {
+	return c.DisableUpdateCheck
 }
 
 // GetPythonEnvironments returns all Python environments
