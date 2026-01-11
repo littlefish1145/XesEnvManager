@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"python-manager/pkg/config"
@@ -23,7 +25,7 @@ import (
 // Global variables
 var (
 	cfg        *config.PythonConfig
-	AppVersion = "stable_1.0.0"
+	AppVersion = "stable_0.2.2"
 )
 
 const (
@@ -88,7 +90,7 @@ func main() {
 		if arg == "--help" || arg == "-h" {
 			showHelp()
 			return
-		} else if arg == "--update" || arg == "-u" {
+		} else if arg == "--update" || arg == "-U" {
 			updateSelf()
 			return
 		} else if arg == "--list" || arg == "-l" {
@@ -195,13 +197,12 @@ func main() {
 		cfg.DisplayCurrentEnvironment()
 	}
 
-	// Check for updates if not disabled
-	if !cfg.GetDisableUpdateCheck() {
-		checkUpdateSilent()
-	}
-
 	// If no Python arguments, just display info
 	if len(pythonArgs) == 0 {
+		// Also check update when just showing info
+		if !cfg.GetDisableUpdateCheck() {
+			checkUpdateSilent()
+		}
 		return
 	}
 
@@ -213,6 +214,11 @@ func main() {
 	exec.SetInteractive(true) // Explicitly enable interactive mode
 
 	exitCode := exec.Execute()
+
+	// Check for updates if not disabled, AFTER execution
+	if !cfg.GetDisableUpdateCheck() {
+		checkUpdateSilent()
+	}
 
 	// If execution failed and no automatic module handling (e.g., in terminal mode), display error
 	if exitCode != 0 {
@@ -384,13 +390,51 @@ func updateSelf() {
 	} else {
 		fmt.Println("[2] 预览发布 (Preview): 未找到")
 	}
+
+	// Add settings options
+	autoUpdateStatus := "已关闭"
+	if cfg.GetAutoUpdate() {
+		autoUpdateStatus = "已开启"
+	}
+	disableUpdateStatus := "正常提醒"
+	if cfg.GetDisableUpdateCheck() {
+		disableUpdateStatus = "已屏蔽"
+	}
+
+	fmt.Printf("[A] 自动更新: %s (切换)\n", autoUpdateStatus)
+	fmt.Printf("[N] 更新提醒: %s (切换)\n", disableUpdateStatus)
 	fmt.Println("[Q] 取消更新")
 
-	fmt.Print("\n请输入选项 (1/2/Q): ")
+	fmt.Print("\n请输入选项 (1/2/A/N/Q): ")
 	scanner := bufio.NewScanner(os.Stdin)
 	var choice string
 	if scanner.Scan() {
 		choice = strings.TrimSpace(strings.ToUpper(scanner.Text()))
+	}
+
+	if choice == "A" {
+		newVal := !cfg.GetAutoUpdate()
+		cfg.SetAutoUpdate(newVal)
+		if newVal {
+			fmt.Println("自动更新已开启。")
+		} else {
+			fmt.Println("自动更新已关闭。")
+		}
+		return
+	}
+	if choice == "N" {
+		newVal := !cfg.GetDisableUpdateCheck()
+		cfg.SetDisableUpdateCheck(newVal)
+		if newVal {
+			fmt.Println("更新提醒已屏蔽。")
+		} else {
+			fmt.Println("更新提醒已恢复正常。")
+		}
+		return
+	}
+	if choice == "Q" {
+		fmt.Println("已退出更新菜单。")
+		return
 	}
 
 	var selectedRelease *ReleaseInfo
@@ -399,7 +443,7 @@ func updateSelf() {
 	} else if choice == "2" {
 		selectedRelease = previewRelease
 	} else {
-		fmt.Println("已取消更新。")
+		fmt.Println("无效选项，已退出。")
 		return
 	}
 
@@ -484,73 +528,147 @@ func downloadAndReplace(url string) error {
 	tmpPath := exePath + ".tmp"
 	oldPath := exePath + ".old"
 
-	// Create request
-	resp, err := http.Get(url)
+	// Create request to get file size
+	respHead, err := http.Head(url)
 	if err != nil {
-		return fmt.Errorf("下载失败: %v", err)
+		return fmt.Errorf("连接失败: %v", err)
 	}
-	defer resp.Body.Close()
+	if respHead.StatusCode != http.StatusOK {
+		return fmt.Errorf("连接失败，状态码: %d", respHead.StatusCode)
+	}
+	contentLength := respHead.ContentLength
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载失败，状态码: %d", resp.StatusCode)
+	// Support 16 threads
+	numThreads := 16
+	chunkSize := contentLength / int64(numThreads)
+	if chunkSize == 0 {
+		numThreads = 1
+		chunkSize = contentLength
 	}
 
-	// Get content length for progress bar
-	contentLength := resp.ContentLength
-
-	// Create temporary file
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return fmt.Errorf("无法创建临时文件: %v", err)
-	}
-	defer out.Close()
-
-	// Download with progress bar
+	var wg sync.WaitGroup
+	errors := make(chan error, numThreads)
 	var downloaded int64
-	buffer := make([]byte, 32*1024)
+	var downloadedMutex sync.Mutex
+
+	// Create temporary directory for chunks
+	tempDir := filepath.Join(os.TempDir(), "python-mgr-update")
+	os.MkdirAll(tempDir, 0755)
+	defer os.RemoveAll(tempDir)
+
+	fmt.Print("\r正在多线程下载: [....................] 0%")
+
 	lastUpdate := time.Now()
 
-	fmt.Print("\r进度: [....................] 0%")
+	for i := 0; i < numThreads; i++ {
+		wg.Add(1)
+		start := int64(i) * chunkSize
+		end := start + chunkSize - 1
+		if i == numThreads-1 {
+			end = contentLength - 1
+		}
 
-	for {
-		n, err := resp.Body.Read(buffer)
-		if n > 0 {
-			_, writeErr := out.Write(buffer[:n])
-			if writeErr != nil {
-				return fmt.Errorf("写入文件失败: %v", writeErr)
+		go func(index int, start, end int64) {
+			defer wg.Done()
+
+			chunkPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", index))
+			var currentStart int64 = start
+
+			// Check for existing chunk for resume
+			if info, err := os.Stat(chunkPath); err == nil {
+				currentStart += info.Size()
 			}
-			downloaded += int64(n)
 
-			// Update progress bar every 100ms or when finished
-			if time.Since(lastUpdate) > 100*time.Millisecond || downloaded == contentLength {
-				lastUpdate = time.Now()
-				percent := float64(downloaded) / float64(contentLength) * 100
-				bars := int(percent / 5)
-				barStr := ""
-				for i := 0; i < 20; i++ {
-					if i < bars {
-						barStr += "#"
-					} else {
-						barStr += "."
+			if currentStart > end {
+				downloadedMutex.Lock()
+				downloaded += (end - start + 1)
+				downloadedMutex.Unlock()
+				return
+			}
+
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", currentStart, end))
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer resp.Body.Close()
+
+			// Append to chunk file
+			f, err := os.OpenFile(chunkPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer f.Close()
+
+			buffer := make([]byte, 32*1024)
+			for {
+				n, err := resp.Body.Read(buffer)
+				if n > 0 {
+					f.Write(buffer[:n])
+					downloadedMutex.Lock()
+					downloaded += int64(n)
+
+					// Update progress bar
+					if time.Since(lastUpdate) > 100*time.Millisecond {
+						lastUpdate = time.Now()
+						percent := float64(downloaded) / float64(contentLength) * 100
+						bars := int(percent / 5)
+						barStr := ""
+						for b := 0; b < 20; b++ {
+							if b < bars {
+								barStr += "#"
+							} else {
+								barStr += "."
+							}
+						}
+						fmt.Printf("\r正在多线程下载: [%s] %.1f%%", barStr, percent)
+						os.Stdout.Sync()
 					}
+					downloadedMutex.Unlock()
 				}
-				fmt.Printf("\r进度: [%s] %.1f%%", barStr, percent)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					errors <- err
+					return
+				}
 			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("下载过程中出错: %v", err)
-		}
+		}(i, start, end)
 	}
-	fmt.Println()
 
-	// Close file before renaming
-	out.Close()
+	wg.Wait()
+	close(errors)
+	if len(errors) > 0 {
+		return <-errors
+	}
+
+	fmt.Printf("\r正在多线程下载: [%s] 100.0%%", "####################")
+	fmt.Println("\n正在合并文件...")
+
+	// Merge chunks
+	finalOut, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("合并失败: %v", err)
+	}
+
+	for i := 0; i < numThreads; i++ {
+		chunkPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", i))
+		chunkData, err := os.ReadFile(chunkPath)
+		if err != nil {
+			finalOut.Close()
+			return fmt.Errorf("读取分片失败: %v", err)
+		}
+		finalOut.Write(chunkData)
+	}
+	finalOut.Close()
 
 	// Windows specific: rename current exe to .old, then rename .tmp to current exe
-	// This works even if the file is locked for execution
 	if _, err := os.Stat(oldPath); err == nil {
 		os.Remove(oldPath)
 	}
@@ -560,7 +678,6 @@ func downloadAndReplace(url string) error {
 	}
 
 	if err := os.Rename(tmpPath, exePath); err != nil {
-		// Try to restore if failed
 		os.Rename(oldPath, exePath)
 		return fmt.Errorf("无法替换程序文件: %v", err)
 	}
@@ -582,7 +699,7 @@ func showHelp() {
 	fmt.Println("  --search, -s             搜索所有可用的Python环境")
 	fmt.Println("  --info, -i               显示当前Python环境信息")
 	fmt.Println("  --edit, -e               在记事本中编辑配置文件")
-	fmt.Println("  --update, -u             从 Github 自动更新程序")
+	fmt.Println("  --update, -U             从 Github 自动更新程序")
 	fmt.Println("  --disable-update         关闭运行时的自动更新检查提示")
 	fmt.Println("  --enable-update          开启运行时的自动更新检查提示")
 	fmt.Println("  --no-capture             不捕获输出（直接显示在控制台）")
@@ -594,6 +711,49 @@ func showHelp() {
 	fmt.Println("  程序名 --set conda_0     设置使用conda_0环境")
 	fmt.Println("  程序名 --list            列出所有Python环境")
 	fmt.Println("  程序名 --edit            在记事本中编辑配置文件")
+}
+
+func doAutoUpdate(rel *ReleaseInfo) {
+	// Find suitable asset for current platform
+	var downloadURL string
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+
+	for _, asset := range rel.Assets {
+		name := strings.ToLower(asset.Name)
+		if strings.Contains(name, runtime.GOOS) && (strings.Contains(name, runtime.GOARCH) || (runtime.GOARCH == "amd64" && strings.Contains(name, "x64"))) {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+
+	if downloadURL == "" {
+		for _, asset := range rel.Assets {
+			name := strings.ToLower(asset.Name)
+			if ext != "" && strings.HasSuffix(name, ext) {
+				downloadURL = asset.BrowserDownloadURL
+				break
+			}
+		}
+	}
+
+	if downloadURL == "" {
+		if len(rel.Assets) > 0 {
+			downloadURL = rel.Assets[0].BrowserDownloadURL
+		} else {
+			return
+		}
+	}
+
+	if err := downloadAndReplace(downloadURL); err != nil {
+		fmt.Printf("自动更新失败: %v\n", err)
+		return
+	}
+
+	fmt.Println("\n自动更新成功！请重新启动程序。")
+	os.Exit(0)
 }
 
 // checkUpdateSilent checks for updates silently and prints a hint if available
@@ -638,17 +798,57 @@ func checkUpdateSilent() {
 		}
 	}
 
-	hint := ""
+	// If auto-update is enabled, update without asking
+	if cfg.GetAutoUpdate() {
+		if latestStable != nil && isNewerThan(latestStable.TagName, AppVersion) {
+			fmt.Printf("检测到新版本 %s，正在自动更新...\n", latestStable.TagName)
+			// Call updateSelf logic or a direct download
+			doAutoUpdate(latestStable)
+			return
+		}
+	}
+
+	var hint string
 	if latestStable != nil && isNewerThan(latestStable.TagName, AppVersion) {
-		hint = fmt.Sprintf("\n[提示] 发现新正式版: %s (当前版本: %s)", latestStable.TagName, AppVersion)
+		hint = fmt.Sprintf("\n[!] 发现新的正式版本: %s (当前版本: %s)", latestStable.TagName, AppVersion)
 	} else if current.Prefix == "pre" && latestPre != nil && isNewerThan(latestPre.TagName, AppVersion) {
-		hint = fmt.Sprintf("\n[提示] 发现新预览版: %s (当前版本: %s)", latestPre.TagName, AppVersion)
+		hint = fmt.Sprintf("\n[!] 发现新的预览版本: %s (当前版本: %s)", latestPre.TagName, AppVersion)
 	}
 
 	if hint != "" {
 		fmt.Println(hint)
-		fmt.Println("使用 '--update' 即可快速选择并更新。")
-		fmt.Println("如果不希望看到此提示，请运行 '--disable-update'。\n")
+		fmt.Println("1. 立即更新")
+		fmt.Println("A. 开启/关闭自动更新")
+		fmt.Println("N. 屏蔽/恢复更新提醒")
+		fmt.Println("Q. 稍后提醒")
+		fmt.Print("\n请选择 (1/A/N/Q): ")
+
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			choice := strings.TrimSpace(strings.ToUpper(scanner.Text()))
+			switch choice {
+			case "1":
+				updateSelf()
+			case "A":
+				newVal := !cfg.GetAutoUpdate()
+				cfg.SetAutoUpdate(newVal)
+				if newVal {
+					fmt.Println("已开启自动更新。")
+				} else {
+					fmt.Println("已关闭自动更新。")
+				}
+			case "N":
+				newVal := !cfg.GetDisableUpdateCheck()
+				cfg.SetDisableUpdateCheck(newVal)
+				if newVal {
+					fmt.Println("已屏蔽更新提醒。")
+				} else {
+					fmt.Println("已恢复更新提醒。")
+				}
+			default:
+				fmt.Println("好的，稍后将再次提醒您。")
+			}
+		}
 	}
 }
 

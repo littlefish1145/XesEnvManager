@@ -21,6 +21,7 @@ type PythonConfig struct {
 	pythonEnvironments     []model.PythonEnvironment
 	currentEnvironmentName string
 	DisableUpdateCheck     bool
+	AutoUpdate             bool
 }
 
 // NewPythonConfig creates a new PythonConfig instance
@@ -28,6 +29,7 @@ func NewPythonConfig(configPath string) *PythonConfig {
 	config := &PythonConfig{
 		currentEnvironmentName: "system",
 		DisableUpdateCheck:     false,
+		AutoUpdate:             false,
 	}
 
 	if configPath == "" {
@@ -92,6 +94,7 @@ func (c *PythonConfig) parseConfigFile(filePath string) bool {
 		CurrentEnvironment string                    `json:"current_environment"`
 		Environments       []model.PythonEnvironment `json:"environments"`
 		DisableUpdateCheck bool                      `json:"disable_update_check"`
+		AutoUpdate         bool                      `json:"auto_update"`
 	}
 
 	if err := json.Unmarshal(data, &configData); err != nil {
@@ -105,6 +108,7 @@ func (c *PythonConfig) parseConfigFile(filePath string) bool {
 
 	c.pythonEnvironments = configData.Environments
 	c.DisableUpdateCheck = configData.DisableUpdateCheck
+	c.AutoUpdate = configData.AutoUpdate
 
 	return true
 }
@@ -115,10 +119,12 @@ func (c *PythonConfig) saveConfigFile(filePath string) bool {
 		CurrentEnvironment string                    `json:"current_environment"`
 		Environments       []model.PythonEnvironment `json:"environments"`
 		DisableUpdateCheck bool                      `json:"disable_update_check"`
+		AutoUpdate         bool                      `json:"auto_update"`
 	}{
 		CurrentEnvironment: c.currentEnvironmentName,
 		Environments:       c.pythonEnvironments,
 		DisableUpdateCheck: c.DisableUpdateCheck,
+		AutoUpdate:         c.AutoUpdate,
 	}
 
 	data, err := json.MarshalIndent(configData, "", "  ")
@@ -535,6 +541,17 @@ func (c *PythonConfig) SetDisableUpdateCheck(disabled bool) bool {
 // GetDisableUpdateCheck returns the update check preference
 func (c *PythonConfig) GetDisableUpdateCheck() bool {
 	return c.DisableUpdateCheck
+}
+
+// SetAutoUpdate sets the auto update preference
+func (c *PythonConfig) SetAutoUpdate(auto bool) bool {
+	c.AutoUpdate = auto
+	return c.saveConfigFile(c.configFilePath)
+}
+
+// GetAutoUpdate returns the auto update preference
+func (c *PythonConfig) GetAutoUpdate() bool {
+	return c.AutoUpdate
 }
 
 // GetPythonEnvironments returns all Python environments
