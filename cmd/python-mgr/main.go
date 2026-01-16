@@ -25,7 +25,7 @@ import (
 // Global variables
 var (
 	cfg        *config.PythonConfig
-	AppVersion = "stable_0.2.2"
+	AppVersion = "stable_0.2.3"
 )
 
 const (
