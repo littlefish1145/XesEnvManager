@@ -17,14 +17,14 @@ import (
 
 // PythonExecutor executes Python scripts with various options
 type PythonExecutor struct {
-	config         *config.PythonConfig
-	pythonPath     string
-	args           []string
-	captureOutput  bool
-	autoExit       bool
-	interactive    bool
-	lastOutput     string
-	lastError      string
+	config        *config.PythonConfig
+	pythonPath    string
+	args          []string
+	captureOutput bool
+	autoExit      bool
+	interactive   bool
+	lastOutput    string
+	lastError     string
 }
 
 // NewPythonExecutor creates a new PythonExecutor instance
@@ -147,7 +147,7 @@ func (e *PythonExecutor) executeInWSL() int {
 	// For WSL environment, we don't pre-collect input data
 	// Instead, we rely on the WSL server to handle real-time input
 	var inputData string
-	
+
 	// Execute Python script via WSL
 	exitCode, output, errorStr, err := client.ExecutePythonWithInput(e.pythonPath, e.args, e.captureOutput, e.autoExit, e.interactive, inputData)
 	if err != nil {
@@ -164,10 +164,33 @@ func (e *PythonExecutor) executeInWSL() int {
 	// Print error if exists
 	if errorStr != "" {
 		fmt.Fprintln(os.Stderr, errorStr)
-		e.lastError = errorStr
+		// Limit the error stored in memory
+		lines := strings.Split(errorStr, "\n")
+		if len(lines) > 100 {
+			e.lastError = strings.Join(lines[len(lines)-100:], "\n")
+		} else {
+			e.lastError = errorStr
+		}
 	}
 
 	return int(exitCode)
+}
+
+// captureErrorLine captures the last 100 lines of error output to avoid memory leak
+func (e *PythonExecutor) captureErrorLine(line string) {
+	// If it's the first line, just set it
+	if e.lastError == "" {
+		e.lastError = line
+		return
+	}
+
+	// Split by newline and keep last 100 lines
+	lines := strings.Split(e.lastError, "\n")
+	if len(lines) >= 100 {
+		lines = lines[len(lines)-99:]
+	}
+	lines = append(lines, line)
+	e.lastError = strings.Join(lines, "\n")
 }
 
 // collectInputData collects input data from the user for interactive scripts
@@ -178,19 +201,19 @@ func (e *PythonExecutor) collectInputData() string {
 	}
 
 	fmt.Println("This script requires input. Please enter the input data (press Ctrl+Z then Enter on Windows or Ctrl+D on Unix when done):")
-	
+
 	var inputData strings.Builder
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		inputData.WriteString(scanner.Text())
 		inputData.WriteString("\n")
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error reading input: %v\n", err)
 		return ""
 	}
-	
+
 	return inputData.String()
 }
 
@@ -204,7 +227,7 @@ func (e *PythonExecutor) scriptNeedsInput() bool {
 			if err != nil {
 				continue
 			}
-			
+
 			// Check if the content contains input() calls
 			contentStr := string(content)
 			if strings.Contains(contentStr, "input(") {
@@ -212,7 +235,7 @@ func (e *PythonExecutor) scriptNeedsInput() bool {
 			}
 		}
 	}
-	
+
 	return false
 }
 
@@ -266,26 +289,43 @@ func (e *PythonExecutor) executeWithOutputCapture() int {
 		return 1
 	}
 
-	// Read stdout
-	stdoutScanner := bufio.NewScanner(stdout)
-	for stdoutScanner.Scan() {
-		line := stdoutScanner.Text()
-		e.lastOutput += line + "\n"
-		// Directly output to console (already UTF-8 encoded)
-		fmt.Println(line)
-	}
+	// Use channels to signal completion of reading
+	stdoutDone := make(chan bool)
+	stderrDone := make(chan bool)
 
-	// Read stderr
-	stderrScanner := bufio.NewScanner(stderr)
-	for stderrScanner.Scan() {
-		line := stderrScanner.Text()
-		e.lastError += line + "\n"
-		// Directly output to console (already UTF-8 encoded)
-		fmt.Fprintln(os.Stderr, line)
-	}
+	// Read stdout in a goroutine
+	go func() {
+		stdoutScanner := bufio.NewScanner(stdout)
+		for stdoutScanner.Scan() {
+			line := stdoutScanner.Text()
+			// Only capture last few lines of output to avoid memory leak
+			// lastOutput is not currently used by the CLI anyway
+
+			// Directly output to console (already UTF-8 encoded)
+			fmt.Println(line)
+		}
+		stdoutDone <- true
+	}()
+
+	// Read stderr in a goroutine
+	go func() {
+		stderrScanner := bufio.NewScanner(stderr)
+		for stderrScanner.Scan() {
+			line := stderrScanner.Text()
+			e.captureErrorLine(line)
+			// Directly output to console (already UTF-8 encoded)
+			fmt.Fprintln(os.Stderr, line)
+		}
+		stderrDone <- true
+	}()
 
 	// Wait for command to finish
 	err = cmd.Wait()
+
+	// Wait for readers to finish
+	<-stdoutDone
+	<-stderrDone
+
 	if err != nil {
 		// Check exit code
 		if exitError, ok := err.(*exec.ExitError); ok {
@@ -340,17 +380,16 @@ func (e *PythonExecutor) executeWithTerminalHandling() int {
 	}
 
 	// Read stderr in a goroutine
-	errChan := make(chan string, 1)
+	stderrDone := make(chan bool)
 	go func() {
 		stderrScanner := bufio.NewScanner(stderr)
-		var errorOutput string
 		for stderrScanner.Scan() {
 			line := stderrScanner.Text()
-			errorOutput += line + "\n"
+			e.captureErrorLine(line)
 			// Directly output to console (already UTF-8 encoded)
 			fmt.Fprintln(os.Stderr, line)
 		}
-		errChan <- errorOutput
+		stderrDone <- true
 	}()
 
 	// Wait for command to finish or timeout
@@ -396,8 +435,8 @@ func (e *PythonExecutor) executeWithTerminalHandling() int {
 		}
 	}
 
-	// Get stderr output
-	e.lastError = <-errChan
+	// Wait for stderr reader to finish
+	<-stderrDone
 
 	// Get exit code
 	if exitError, ok := waitResult.(*exec.ExitError); ok {
@@ -473,7 +512,7 @@ func (e *PythonExecutor) installMissingModules(modules []string) bool {
 	}
 
 	fmt.Println("\n直接按 Enter 安装以上模块，或者输入额外的包名（多个包用空格分隔）后按 Enter:")
-	
+
 	scanner := bufio.NewScanner(os.Stdin)
 	var input string
 	if scanner.Scan() {
@@ -523,7 +562,7 @@ func (e *PythonExecutor) runPipInstall(modules []string) bool {
 	if err != nil {
 		fmt.Printf("模块安装失败: %v\n", err)
 		fmt.Println("是否尝试手动输入包名重新安装？(y/n)")
-		
+
 		scanner := bufio.NewScanner(os.Stdin)
 		var retry string
 		if scanner.Scan() {
@@ -539,7 +578,7 @@ func (e *PythonExecutor) runPipInstall(modules []string) bool {
 				}
 			}
 		}
-		
+
 		fmt.Println("请手动运行以下命令安装模块:")
 		fmt.Printf("%s %s\n", e.pythonPath, strings.Join(pipArgs, " "))
 		return false

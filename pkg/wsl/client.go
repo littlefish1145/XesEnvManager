@@ -3,7 +3,8 @@ package wsl
 import (
 	"context"
 	"fmt"
-	"log"
+
+	// "log"
 	"python-manager/pkg/model"
 	"python-manager/proto"
 	"strings"
@@ -127,19 +128,21 @@ func ConvertWindowsPathToWSL(path string) string {
 
 // TestWSLConnection tests if we can connect to the WSL server
 func TestWSLConnection(address string) bool {
-	client, err := NewWSLClient(address)
-	if err != nil {
-		log.Printf("WSL connection test failed: %v", err)
-		return false
-	}
-	defer client.Close()
+	// Set up gRPC connection with a short timeout to avoid hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
 
-	// Try to search environments as a test
-	_, err = client.SearchEnvironments()
+	// Dial with block and timeout to quickly check if server is up
+	conn, err := grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+
 	if err != nil {
-		log.Printf("WSL connection test failed during search: %v", err)
+		// Silently return false if connection fails - this is normal if WSL server is not running
 		return false
 	}
+	defer conn.Close()
 
 	return true
 }

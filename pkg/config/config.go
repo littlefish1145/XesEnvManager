@@ -485,17 +485,15 @@ func (c *PythonConfig) SearchPythonEnvironments() {
 		addEnvironmentIfUnique(fmt.Sprintf("venv_%d", i), venvPython, false, "windows") // Venv environments disabled by default
 	}
 
-	// Search WSL environments if WSL is available
-	if IsWSLAvailable() {
-		wslEnvironments, err := c.SearchWSLEnvironments()
-		if err == nil {
-			for _, env := range wslEnvironments {
-				// Check if this path is already processed to avoid duplicates
-				if !processedPaths[env.Path] {
-					env.Platform = "wsl"
-					c.pythonEnvironments = append(c.pythonEnvironments, env)
-					processedPaths[env.Path] = true
-				}
+	// Search WSL environments
+	wslEnvironments, err := c.SearchWSLEnvironments()
+	if err == nil {
+		for _, env := range wslEnvironments {
+			// Check if this path is already processed to avoid duplicates
+			if !processedPaths[env.Path] {
+				env.Platform = "wsl"
+				c.pythonEnvironments = append(c.pythonEnvironments, env)
+				processedPaths[env.Path] = true
 			}
 		}
 	}
@@ -512,6 +510,11 @@ func IsWSLAvailable() bool {
 
 // SearchWSLEnvironments searches for Python environments via WSL server
 func (c *PythonConfig) SearchWSLEnvironments() ([]model.PythonEnvironment, error) {
+	// First check if WSL server is available silently
+	if !IsWSLAvailable() {
+		return nil, nil // Silently skip if not available
+	}
+
 	client, err := wsl.NewWSLClient("localhost:50051")
 	if err != nil {
 		return nil, err
