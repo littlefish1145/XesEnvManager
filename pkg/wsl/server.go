@@ -30,8 +30,8 @@ import (
 // Pre-compiled regex patterns for performance
 var (
 	pythonVersionRegexOnce sync.Once
-	pythonVersionRegex    *regexp.Regexp
-	pythonVersionRegex2   *regexp.Regexp
+	pythonVersionRegex     *regexp.Regexp
+	pythonVersionRegex2    *regexp.Regexp
 )
 
 // getPythonVersionRegex returns the compiled version regex patterns
@@ -100,7 +100,7 @@ func terminateProcess(process *os.Process) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if processState := getProcessState(process); processState == nil || !processState.Exited() {
+	if isProcessRunning(process) {
 		if err == nil {
 			syscall.Kill(-pgid, syscall.SIGKILL)
 		} else {
@@ -109,11 +109,13 @@ func terminateProcess(process *os.Process) {
 	}
 }
 
-func getProcessState(process *os.Process) *os.ProcessState {
+func isProcessRunning(process *os.Process) bool {
 	if process == nil {
-		return nil
+		return false
 	}
-	return process.ProcessState
+	// On Unix, sending signal 0 to a process checks if it exists.
+	err := process.Signal(syscall.Signal(0))
+	return err == nil
 }
 
 func closeCommandResources(cmd *exec.Cmd) {
