@@ -46,12 +46,27 @@ func (c *WSLClient) Close() error {
 
 // SearchEnvironments searches for Python environments via WSL
 func (c *WSLClient) SearchEnvironments() ([]model.PythonEnvironment, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return c.SearchEnvironmentsWithContext(context.Background())
+}
+
+// SearchEnvironmentsWithContext searches for Python environments via WSL with custom context
+func (c *WSLClient) SearchEnvironmentsWithContext(ctx context.Context) ([]model.PythonEnvironment, error) {
+	// Create a new context with timeout if none is provided or if the existing context has no timeout
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("context error: %v", ctx.Err())
+	}
+	
+	// Set a default timeout of 30 seconds if the context doesn't have one
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	req := &proto.SearchEnvironmentsRequest{}
 	resp, err := c.client.SearchEnvironments(ctx, req)
 	if err != nil {
+		// Check if it's a timeout error
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("timeout while searching environments: %v", err)
+		}
 		return nil, fmt.Errorf("failed to search environments: %v", err)
 	}
 
@@ -79,7 +94,18 @@ func (c *WSLClient) ExecutePython(pythonPath string, arguments []string, capture
 
 // ExecutePythonWithInput executes a Python script via WSL with input data
 func (c *WSLClient) ExecutePythonWithInput(pythonPath string, arguments []string, captureOutput bool, autoExit bool, interactive bool, inputData string) (int32, string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return c.ExecutePythonWithContext(context.Background(), pythonPath, arguments, captureOutput, autoExit, interactive, inputData)
+}
+
+// ExecutePythonWithContext executes a Python script via WSL with custom context
+func (c *WSLClient) ExecutePythonWithContext(ctx context.Context, pythonPath string, arguments []string, captureOutput bool, autoExit bool, interactive bool, inputData string) (int32, string, string, error) {
+	// Create a new context with timeout if none is provided or if the existing context has no timeout
+	if ctx.Err() != nil {
+		return 1, "", fmt.Sprintf("context error: %v", ctx.Err()), ctx.Err()
+	}
+	
+	// Set a default timeout of 60 seconds if the context doesn't have one
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	// Convert Windows paths to WSL paths
@@ -105,6 +131,10 @@ func (c *WSLClient) ExecutePythonWithInput(pythonPath string, arguments []string
 
 	resp, err := c.client.ExecutePython(ctx, req)
 	if err != nil {
+		// Check if it's a timeout error
+		if ctx.Err() == context.DeadlineExceeded {
+			return 1, "", fmt.Sprintf("timeout while executing Python: %v", err), err
+		}
 		return 1, "", fmt.Sprintf("failed to execute Python: %v", err), err
 	}
 

@@ -10,6 +10,8 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +26,22 @@ import (
 
 	"google.golang.org/grpc"
 )
+
+// Pre-compiled regex patterns for performance
+var (
+	pythonVersionRegexOnce sync.Once
+	pythonVersionRegex    *regexp.Regexp
+	pythonVersionRegex2   *regexp.Regexp
+)
+
+// getPythonVersionRegex returns the compiled version regex patterns
+func getPythonVersionRegex() (*regexp.Regexp, *regexp.Regexp) {
+	pythonVersionRegexOnce.Do(func() {
+		pythonVersionRegex = regexp.MustCompile(`Python (\d+\.\d+\.\d+)`)
+		pythonVersionRegex2 = regexp.MustCompile(`Python (\d+\.\d+\.\d+\S*)`)
+	})
+	return pythonVersionRegex, pythonVersionRegex2
+}
 
 // ProcessManager manages running Python processes
 type ProcessManager struct {
@@ -65,28 +83,53 @@ func (pm *ProcessManager) cleanupCommand(cmd *exec.Cmd) {
 		return
 	}
 
-	// Try to terminate the process group
 	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
-		// Unix-like systems: use process group
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
+		terminateProcess(cmd.Process)
+	}
+
+	closeCommandResources(cmd)
+}
+
+func terminateProcess(process *os.Process) {
+	pgid, err := syscall.Getpgid(process.Pid)
+	if err == nil {
+		syscall.Kill(-pgid, syscall.SIGTERM)
+	} else {
+		process.Kill()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if processState := getProcessState(process); processState == nil || !processState.Exited() {
 		if err == nil {
-			// Kill the entire process group
-			syscall.Kill(-pgid, syscall.SIGTERM)
+			syscall.Kill(-pgid, syscall.SIGKILL)
 		} else {
-			// Fallback: kill just the process
-			cmd.Process.Kill()
+			process.Kill()
 		}
+	}
+}
 
-		// Wait a bit for graceful termination
-		time.Sleep(100 * time.Millisecond)
+func getProcessState(process *os.Process) *os.ProcessState {
+	if process == nil {
+		return nil
+	}
+	return process.ProcessState
+}
 
-		// If still running, force kill
-		if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
-			if err == nil {
-				syscall.Kill(-pgid, syscall.SIGKILL)
-			} else {
-				cmd.Process.Kill()
-			}
+func closeCommandResources(cmd *exec.Cmd) {
+	if cmd.Stdout != nil {
+		if closer, ok := cmd.Stdout.(io.Closer); ok {
+			closer.Close()
+		}
+	}
+	if cmd.Stderr != nil {
+		if closer, ok := cmd.Stderr.(io.Closer); ok {
+			closer.Close()
+		}
+	}
+	if cmd.Stdin != nil {
+		if closer, ok := cmd.Stdin.(io.Closer); ok {
+			closer.Close()
 		}
 	}
 }
@@ -182,286 +225,244 @@ func (s *WSLPythonServer) SearchEnvironments(ctx context.Context, req *proto.Sea
 func (s *WSLPythonServer) ExecutePython(ctx context.Context, req *proto.ExecutePythonRequest) (*proto.ExecutePythonResponse, error) {
 	log.Printf("Executing Python script in WSL: %s", strings.Join(req.Arguments, " "))
 
-	// Check if Python exists
+	if err := validatePythonRequest(req); err != nil {
+		return createErrorResponse(1, err.Error()), nil
+	}
+
+	cmd := createPythonCommand(req)
+	setupProcessGroup(cmd)
+	setupEnvironment(cmd)
+
+	commandID := fmt.Sprintf("%d", time.Now().UnixNano())
+	processManager.AddCommand(commandID, cmd)
+	defer processManager.RemoveCommand(commandID)
+
+	var response *proto.ExecutePythonResponse
+	if req.Interactive {
+		response = executeInteractive(ctx, cmd, req, commandID)
+	} else if req.CaptureOutput {
+		response = executeWithCapture(cmd)
+	} else {
+		response = executeWithoutCapture(cmd)
+	}
+
+	return response, nil
+}
+
+func validatePythonRequest(req *proto.ExecutePythonRequest) error {
 	if req.PythonPath == "" {
-		return &proto.ExecutePythonResponse{
-			ExitCode: 1,
-			Error:    "Python path is empty",
-		}, nil
+		return fmt.Errorf("Python path is empty")
 	}
 
 	if _, err := os.Stat(req.PythonPath); os.IsNotExist(err) {
-		return &proto.ExecutePythonResponse{
-			ExitCode: 1,
-			Error:    fmt.Sprintf("Python executable does not exist: %s", req.PythonPath),
-		}, nil
+		return fmt.Errorf("Python executable does not exist: %s", req.PythonPath)
 	}
 
-	// Build command arguments
+	return nil
+}
+
+func createPythonCommand(req *proto.ExecutePythonRequest) *exec.Cmd {
 	cmdArgs := []string{}
 	cmdArgs = append(cmdArgs, req.Arguments...)
+	return exec.Command(req.PythonPath, cmdArgs...)
+}
 
-	// Create command
-	cmd := exec.Command(req.PythonPath, cmdArgs...)
-
-	// Set process group to allow killing the entire process tree
+func setupProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+}
 
-	// Set environment variables to ensure UTF-8 encoding
+func setupEnvironment(cmd *exec.Cmd) {
 	cmd.Env = append(os.Environ(),
 		"PYTHONIOENCODING=utf-8",
 		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
 	)
+}
 
-	// Generate a unique ID for this command
-	commandID := fmt.Sprintf("%d", time.Now().UnixNano())
+func createErrorResponse(exitCode int32, errorMsg string) *proto.ExecutePythonResponse {
+	return &proto.ExecutePythonResponse{
+		ExitCode: exitCode,
+		Error:    errorMsg,
+	}
+}
 
-	// Register command with the process manager
-	processManager.AddCommand(commandID, cmd)
+func executeInteractive(ctx context.Context, cmd *exec.Cmd, req *proto.ExecutePythonRequest, commandID string) *proto.ExecutePythonResponse {
+	stdinPipe, stdoutPipe, stderrPipe, err := createPipes(cmd)
+	if err != nil {
+		return createErrorResponse(1, err.Error())
+	}
 
-	// Ensure cleanup when done
-	defer processManager.RemoveCommand(commandID)
+	if err := cmd.Start(); err != nil {
+		closeAllPipes(stdinPipe, stdoutPipe, stderrPipe)
+		return createErrorResponse(1, fmt.Sprintf("Failed to start command: %v", err))
+	}
 
-	// Execute command
-	var output []byte
-	var err error
+	stdinCtx, stdinCancel := context.WithCancel(context.Background())
+	handleStdin(stdinCtx, stdinCancel, stdinPipe, req)
 
-	if req.Interactive {
-		// For interactive scripts in WSL, we need to handle input/output carefully
-		// Use a pseudo-terminal approach if available, otherwise fall back to pipes
+	stdoutBytes, stderrBytes, cmdErr := waitForInteractiveCommand(ctx, cmd, stdoutPipe, stderrPipe, stdinCancel, commandID)
 
-		// Create pipes for stdin, stdout, and stderr
-		stdinPipe, err := cmd.StdinPipe()
-		if err != nil {
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    fmt.Sprintf("Failed to create stdin pipe: %v", err),
-			}, nil
+	combinedOutput := string(stdoutBytes) + string(stderrBytes)
+	return buildResponse(cmdErr, combinedOutput, string(stdoutBytes))
+}
+
+func createPipes(cmd *exec.Cmd) (io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Failed to create stdin pipe: %v", err)
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		stdinPipe.Close()
+		return nil, nil, nil, fmt.Errorf("Failed to create stdout pipe: %v", err)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		stdinPipe.Close()
+		stdoutPipe.Close()
+		return nil, nil, nil, fmt.Errorf("Failed to create stderr pipe: %v", err)
+	}
+
+	return stdinPipe, stdoutPipe, stderrPipe, nil
+}
+
+func closeAllPipes(stdinPipe io.WriteCloser, stdoutPipe, stderrPipe io.ReadCloser) {
+	stdinPipe.Close()
+	stdoutPipe.Close()
+	stderrPipe.Close()
+}
+
+func handleStdin(ctx context.Context, cancel context.CancelFunc, stdinPipe io.WriteCloser, req *proto.ExecutePythonRequest) {
+	if req.InputData != "" {
+		if _, err := stdinPipe.Write([]byte(req.InputData)); err != nil {
+			log.Printf("Warning: Failed to write input data: %v", err)
 		}
+		stdinPipe.Close()
+		cancel()
+		return
+	}
 
-		stdoutPipe, err := cmd.StdoutPipe()
-		if err != nil {
+	go func() {
+		defer func() {
 			stdinPipe.Close()
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    fmt.Sprintf("Failed to create stdout pipe: %v", err),
-			}, nil
-		}
-
-		stderrPipe, err := cmd.StderrPipe()
-		if err != nil {
-			stdinPipe.Close()
-			stdoutPipe.Close()
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    fmt.Sprintf("Failed to create stderr pipe: %v", err),
-			}, nil
-		}
-
-		// Start the command
-		if err := cmd.Start(); err != nil {
-			stdinPipe.Close()
-			stdoutPipe.Close()
-			stderrPipe.Close()
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    fmt.Sprintf("Failed to start command: %v", err),
-			}, nil
-		}
-
-		// Create a context to control the stdin copy goroutine
-		stdinCtx, stdinCancel := context.WithCancel(context.Background())
-
-		// For WSL environment, we need to handle input differently
-		// If there's input data provided, use it; otherwise, connect stdin for real-time input
-		if req.InputData != "" {
-			// Write the provided input data to stdin
-			if _, err := stdinPipe.Write([]byte(req.InputData)); err != nil {
-				log.Printf("Warning: Failed to write input data: %v", err)
-			}
-			stdinPipe.Close()
-			stdinCancel()
-		} else {
-			// For truly interactive scripts, we need to connect stdin directly
-			// This allows real-time input from the user, but only if stdin is available
-			go func() {
-				defer func() {
-					stdinPipe.Close()
-					stdinCancel()
-				}()
-				// Check if stdin is connected and copy from it to the process stdin
-				// Use a non-blocking approach to avoid hanging when no stdin is available
-				stat, err := os.Stdin.Stat()
-				if err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
-					// Stdin is not connected or is connected to a terminal
-					// In this case, just let the process run without stdin connection
-					return
-				}
-				// Check if context is cancelled before copying
-				select {
-				case <-stdinCtx.Done():
-					return
-				default:
-				}
-				// Stdin is connected, copy data with context cancellation support
-				io.Copy(stdinPipe, os.Stdin)
-			}()
-		}
-
-		// Read all output from stdout and stderr with proper cancellation support
-		stdoutChan := make(chan []byte, 1)
-		stderrChan := make(chan []byte, 1)
-		var stdoutBytes, stderrBytes []byte
-
-		go func() {
-			var err error
-			stdoutBytes, err = ioutil.ReadAll(stdoutPipe)
-			if err != nil {
-				log.Printf("Error reading stdout: %v", err)
-			}
-			stdoutChan <- stdoutBytes
+			cancel()
 		}()
 
-		go func() {
-			var err error
-			stderrBytes, err = ioutil.ReadAll(stderrPipe)
-			if err != nil {
-				log.Printf("Error reading stderr: %v", err)
-			}
-			stderrChan <- stderrBytes
-		}()
-
-		// Wait for command to finish with timeout
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Wait()
-		}()
-
-		// Set a timeout based on the context or default to 30 minutes
-		timeout := 30 * time.Minute
-		if deadline, ok := ctx.Deadline(); ok {
-			timeout = time.Until(deadline)
+		stat, err := os.Stdin.Stat()
+		if err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+			return
 		}
 
-		var cmdErr error
 		select {
-		case cmdErr = <-done:
-			// Command completed normally
-		case <-time.After(timeout):
-			// Command timed out
-			log.Printf("Command timed out, terminating...")
-			stdinCancel()
-			cmd.Process.Kill()
-			<-done // Wait for process to actually terminate
-			stdoutBytes = <-stdoutChan
-			stderrBytes = <-stderrChan
-			processManager.RemoveCommand(commandID)
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    "Command execution timed out",
-			}, nil
 		case <-ctx.Done():
-			// Context was cancelled
-			log.Printf("Context cancelled, terminating command...")
-			stdinCancel()
-			cmd.Process.Kill()
-			<-done // Wait for process to actually terminate
-			stdoutBytes = <-stdoutChan
-			stderrBytes = <-stderrChan
-			processManager.RemoveCommand(commandID)
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Error:    "Command execution was cancelled",
-			}, nil
+			return
+		default:
 		}
 
-		// Wait for output reading to complete (with timeout to prevent hanging)
-		select {
-		case <-stdoutChan:
-		case <-time.After(5 * time.Second):
-			log.Printf("Warning: Timeout waiting for stdout")
-		}
+		io.Copy(stdinPipe, os.Stdin)
+	}()
+}
 
-		select {
-		case <-stderrChan:
-		case <-time.After(5 * time.Second):
-			log.Printf("Warning: Timeout waiting for stderr")
-		}
+func waitForInteractiveCommand(ctx context.Context, cmd *exec.Cmd, stdoutPipe, stderrPipe io.ReadCloser, stdinCancel context.CancelFunc, commandID string) ([]byte, []byte, error) {
+	stdoutChan := make(chan []byte, 1)
+	stderrChan := make(chan []byte, 1)
+	var wg sync.WaitGroup
 
-		// Combine stdout and stderr for output
-		combinedOutput := string(stdoutBytes) + string(stderrBytes)
+	wg.Add(2)
+	go readToChannel(stdoutPipe, stdoutChan, &wg, "stdout")
+	go readToChannel(stderrPipe, stderrChan, &wg, "stderr")
 
-		if cmdErr != nil {
-			if exitError, ok := cmdErr.(*exec.ExitError); ok {
-				return &proto.ExecutePythonResponse{
-					ExitCode: int32(exitError.ExitCode()),
-					Output:   combinedOutput,
-					Error:    cmdErr.Error(),
-				}, nil
-			}
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Output:   combinedOutput,
-				Error:    cmdErr.Error(),
-			}, nil
-		}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
 
+	timeout := 30 * time.Minute
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+
+	var cmdErr error
+	select {
+	case cmdErr = <-done:
+	case <-time.After(timeout):
+		log.Printf("Command timed out, terminating...")
+		stdinCancel()
+		cmd.Process.Kill()
+		<-done
+		processManager.RemoveCommand(commandID)
+		return nil, nil, fmt.Errorf("Command execution timed out")
+	case <-ctx.Done():
+		log.Printf("Context cancelled, terminating command...")
+		stdinCancel()
+		cmd.Process.Kill()
+		<-done
+		processManager.RemoveCommand(commandID)
+		return nil, nil, fmt.Errorf("Command execution was cancelled")
+	}
+
+	wg.Wait()
+
+	stdoutBytes := receiveFromChannel(stdoutChan, "stdout")
+	stderrBytes := receiveFromChannel(stderrChan, "stderr")
+
+	return stdoutBytes, stderrBytes, cmdErr
+}
+
+func readToChannel(pipe io.ReadCloser, ch chan []byte, wg *sync.WaitGroup, pipeName string) {
+	defer wg.Done()
+	data, err := ioutil.ReadAll(pipe)
+	if err != nil {
+		log.Printf("Error reading %s: %v", pipeName, err)
+	}
+	ch <- data
+}
+
+func receiveFromChannel(ch chan []byte, pipeName string) []byte {
+	select {
+	case data := <-ch:
+		return data
+	default:
+		log.Printf("Warning: No %s data received", pipeName)
+		return nil
+	}
+}
+
+func executeWithCapture(cmd *exec.Cmd) *proto.ExecutePythonResponse {
+	output, err := cmd.CombinedOutput()
+	return buildResponse(err, string(output), string(output))
+}
+
+func executeWithoutCapture(cmd *exec.Cmd) *proto.ExecutePythonResponse {
+	err := cmd.Run()
+	return buildResponse(err, "", "")
+}
+
+func buildResponse(err error, combinedOutput, stdoutOutput string) *proto.ExecutePythonResponse {
+	if err == nil {
 		return &proto.ExecutePythonResponse{
 			ExitCode: 0,
 			Output:   combinedOutput,
 			Error:    "",
-		}, nil
-	} else if req.CaptureOutput {
-		// For non-interactive scripts with capture output, use CombinedOutput
-		output, err = cmd.CombinedOutput()
-	} else {
-		// If not capturing output, run and wait
-		err = cmd.Run()
-		if err != nil {
-			if exitError, ok := err.(*exec.ExitError); ok {
-				return &proto.ExecutePythonResponse{
-					ExitCode: int32(exitError.ExitCode()),
-					Output:   string(output),
-					Error:    err.Error(),
-				}, nil
-			}
-			return &proto.ExecutePythonResponse{
-				ExitCode: 1,
-				Output:   string(output),
-				Error:    err.Error(),
-			}, nil
 		}
-		return &proto.ExecutePythonResponse{
-			ExitCode: 0,
-			Output:   string(output),
-			Error:    "",
-		}, nil
 	}
 
-	if err != nil {
-		// Check exit code if it's an ExitError
-		if exitError, ok := err.(*exec.ExitError); ok {
-			return &proto.ExecutePythonResponse{
-				ExitCode: int32(exitError.ExitCode()),
-				Output:   string(output),
-				Error:    string(output), // Use combined output as error since it contains error info
-			}, nil
-		}
-		// If it's a different error, return 1
+	if exitError, ok := err.(*exec.ExitError); ok {
 		return &proto.ExecutePythonResponse{
-			ExitCode: 1,
-			Output:   string(output),
-			Error:    err.Error(),
-		}, nil
+			ExitCode: int32(exitError.ExitCode()),
+			Output:   combinedOutput,
+			Error:    stdoutOutput,
+		}
 	}
 
 	return &proto.ExecutePythonResponse{
-		ExitCode: 0,
-		Output:   string(output),
-		Error:    "",
-	}, nil
+		ExitCode: 1,
+		Output:   combinedOutput,
+		Error:    err.Error(),
+	}
 }
 
 // findSystemPython finds system Python installations in WSL
@@ -498,14 +499,32 @@ func findSystemPython() string {
 func findCondaEnvironments() []string {
 	var condaEnvs []string
 
-	// Check if conda is available
-	cmd := exec.Command("which", "conda")
-	if err := cmd.Run(); err != nil {
-		return condaEnvs // Conda not available
+	if !isCondaAvailable() {
+		return condaEnvs
 	}
 
-	// Get conda environment list
-	cmd = exec.Command("conda", "env", "list")
+	condaEnvs = append(condaEnvs, getCondaEnvList()...)
+
+	if len(condaEnvs) == 0 {
+		homeDir, err := os.UserHomeDir()
+		if err == nil {
+			condaEnvs = append(condaEnvs, searchMinicondaEnvs(homeDir)...)
+			condaEnvs = append(condaEnvs, searchAnacondaEnvs(homeDir)...)
+		}
+	}
+
+	return condaEnvs
+}
+
+func isCondaAvailable() bool {
+	cmd := exec.Command("which", "conda")
+	return cmd.Run() == nil
+}
+
+func getCondaEnvList() []string {
+	var condaEnvs []string
+
+	cmd := exec.Command("conda", "env", "list")
 	output, err := cmd.Output()
 	if err != nil {
 		return condaEnvs
@@ -514,28 +533,23 @@ func findCondaEnvironments() []string {
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Skip current environment indicator
 		if line == "*" || strings.HasPrefix(line, "*") {
 			continue
 		}
 
-		// Parse environment name and path
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
 			envName := parts[0]
 			envPath := parts[1]
 
-			// Skip if envName is the indicator for current env
 			if envName == "*" {
 				continue
 			}
 
-			// Build Python path
 			pythonPath := filepath.Join(strings.Trim(envPath, "* "), "bin", "python")
 			if _, err := os.Stat(pythonPath); err == nil {
 				condaEnvs = append(condaEnvs, pythonPath)
@@ -543,50 +557,52 @@ func findCondaEnvironments() []string {
 		}
 	}
 
-	// If no environments found via conda command, try common installation paths
-	if len(condaEnvs) == 0 {
-		homeDir, err := os.UserHomeDir()
-		if err == nil {
-			// Miniconda
-			minicondaPath := filepath.Join(homeDir, "miniconda3", "bin", "python")
-			if _, err := os.Stat(minicondaPath); err == nil {
-				condaEnvs = append(condaEnvs, minicondaPath)
-			}
+	return condaEnvs
+}
 
-			// Check envs directory
-			envsDir := filepath.Join(homeDir, "miniconda3", "envs")
-			if _, err := os.Stat(envsDir); err == nil {
-				entries, err := ioutil.ReadDir(envsDir)
-				if err == nil {
-					for _, entry := range entries {
-						if entry.IsDir() {
-							pythonPath := filepath.Join(envsDir, entry.Name(), "bin", "python")
-							if _, err := os.Stat(pythonPath); err == nil {
-								condaEnvs = append(condaEnvs, pythonPath)
-							}
-						}
+func searchMinicondaEnvs(homeDir string) []string {
+	var condaEnvs []string
+
+	minicondaPath := filepath.Join(homeDir, "miniconda3", "bin", "python")
+	if _, err := os.Stat(minicondaPath); err == nil {
+		condaEnvs = append(condaEnvs, minicondaPath)
+	}
+
+	envsDir := filepath.Join(homeDir, "miniconda3", "envs")
+	if _, err := os.Stat(envsDir); err == nil {
+		entries, err := ioutil.ReadDir(envsDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					pythonPath := filepath.Join(envsDir, entry.Name(), "bin", "python")
+					if _, err := os.Stat(pythonPath); err == nil {
+						condaEnvs = append(condaEnvs, pythonPath)
 					}
 				}
 			}
+		}
+	}
 
-			// Anaconda
-			anacondaPath := filepath.Join(homeDir, "anaconda3", "bin", "python")
-			if _, err := os.Stat(anacondaPath); err == nil {
-				condaEnvs = append(condaEnvs, anacondaPath)
-			}
+	return condaEnvs
+}
 
-			// Check envs directory for Anaconda
-			envsDir = filepath.Join(homeDir, "anaconda3", "envs")
-			if _, err := os.Stat(envsDir); err == nil {
-				entries, err := ioutil.ReadDir(envsDir)
-				if err == nil {
-					for _, entry := range entries {
-						if entry.IsDir() {
-							pythonPath := filepath.Join(envsDir, entry.Name(), "bin", "python")
-							if _, err := os.Stat(pythonPath); err == nil {
-								condaEnvs = append(condaEnvs, pythonPath)
-							}
-						}
+func searchAnacondaEnvs(homeDir string) []string {
+	var condaEnvs []string
+
+	anacondaPath := filepath.Join(homeDir, "anaconda3", "bin", "python")
+	if _, err := os.Stat(anacondaPath); err == nil {
+		condaEnvs = append(condaEnvs, anacondaPath)
+	}
+
+	envsDir := filepath.Join(homeDir, "anaconda3", "envs")
+	if _, err := os.Stat(envsDir); err == nil {
+		entries, err := ioutil.ReadDir(envsDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					pythonPath := filepath.Join(envsDir, entry.Name(), "bin", "python")
+					if _, err := os.Stat(pythonPath); err == nil {
+						condaEnvs = append(condaEnvs, pythonPath)
 					}
 				}
 			}
@@ -633,13 +649,31 @@ func findUVEnvironments() []string {
 func findVenvEnvironments() []string {
 	var venvEnvs []string
 
-	// Find current directory and search parent directories for venv
 	currentPath, _ := os.Getwd()
 	currentPath = filepath.Clean(currentPath)
 
-	// Search up to 5 levels of parent directories
+	venvEnvs = append(venvEnvs, searchVenvInPathTree(currentPath)...)
+
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		venvEnvs = append(venvEnvs, searchVenvInHome(homeDir)...)
+	}
+
+	virtualEnv := os.Getenv("VIRTUAL_ENV")
+	if virtualEnv != "" {
+		pythonPath := filepath.Join(virtualEnv, "bin", "python")
+		if _, err := os.Stat(pythonPath); err == nil {
+			venvEnvs = append(venvEnvs, pythonPath)
+		}
+	}
+
+	return venvEnvs
+}
+
+func searchVenvInPathTree(currentPath string) []string {
+	var venvEnvs []string
+
 	for i := 0; i < 5; i++ {
-		// Check common virtual environment directory names
 		venvNames := []string{"venv", ".venv", "env", ".env"}
 
 		for _, venvName := range venvNames {
@@ -652,36 +686,27 @@ func findVenvEnvironments() []string {
 			}
 		}
 
-		// Move to parent directory
 		parentPath := filepath.Dir(currentPath)
 		if parentPath == currentPath {
-			// We've reached the root
 			break
 		}
 		currentPath = parentPath
 	}
 
-	// Search home directory for virtual environments
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		venvNames := []string{"venv", ".venv", "env", ".env"}
-		for _, venvName := range venvNames {
-			venvPath := filepath.Join(homeDir, venvName)
-			if _, err := os.Stat(venvPath); err == nil {
-				pythonPath := filepath.Join(venvPath, "bin", "python")
-				if _, err := os.Stat(pythonPath); err == nil {
-					venvEnvs = append(venvEnvs, pythonPath)
-				}
-			}
-		}
-	}
+	return venvEnvs
+}
 
-	// Check VIRTUAL_ENV environment variable
-	virtualEnv := os.Getenv("VIRTUAL_ENV")
-	if virtualEnv != "" {
-		pythonPath := filepath.Join(virtualEnv, "bin", "python")
-		if _, err := os.Stat(pythonPath); err == nil {
-			venvEnvs = append(venvEnvs, pythonPath)
+func searchVenvInHome(homeDir string) []string {
+	var venvEnvs []string
+
+	venvNames := []string{"venv", ".venv", "env", ".env"}
+	for _, venvName := range venvNames {
+		venvPath := filepath.Join(homeDir, venvName)
+		if _, err := os.Stat(venvPath); err == nil {
+			pythonPath := filepath.Join(venvPath, "bin", "python")
+			if _, err := os.Stat(pythonPath); err == nil {
+				venvEnvs = append(venvEnvs, pythonPath)
+			}
 		}
 	}
 
@@ -698,15 +723,14 @@ func getPythonVersion(pythonPath string) string {
 
 	versionOutput := string(output)
 	// Parse version, e.g. from "Python 3.9.7" extract "3.9.7"
-	re := regexp.MustCompile(`Python (\d+\.\d+\.\d+)`)
-	matches := re.FindStringSubmatch(versionOutput)
+	pythonVersionRegex, pythonVersionRegex2 := getPythonVersionRegex()
+	matches := pythonVersionRegex.FindStringSubmatch(versionOutput)
 	if len(matches) > 1 {
 		return matches[1]
 	}
 
 	// Try alternative format "Python 3.9.7+" (with possible revision)
-	re = regexp.MustCompile(`Python (\d+\.\d+\.\d+\S*)`)
-	matches = re.FindStringSubmatch(versionOutput)
+	matches = pythonVersionRegex2.FindStringSubmatch(versionOutput)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -732,6 +756,20 @@ func StartWSLServer(port string) error {
 		log.Printf("Received signal: %v", sig)
 		cleanup()
 		os.Exit(0)
+	}()
+
+	// Start pprof server if enabled
+	go func() {
+		if os.Getenv("PPROF_ENABLED") == "true" {
+			pprofPort := "6060"
+			if envPort := os.Getenv("PPROF_PORT"); envPort != "" {
+				pprofPort = envPort
+			}
+			log.Printf("Starting pprof server on :%s", pprofPort)
+			if err := http.ListenAndServe(":"+pprofPort, nil); err != nil {
+				log.Printf("Pprof server failed: %v", err)
+			}
+		}
 	}()
 
 	lis, err := net.Listen("tcp", ":"+port)

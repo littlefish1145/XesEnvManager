@@ -9,11 +9,28 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"python-manager/pkg/model"
 	"python-manager/pkg/utils"
 	"python-manager/pkg/wsl"
 )
+
+// Pre-compiled regex patterns for performance
+var (
+	versionRegexOnce sync.Once
+	versionRegex     *regexp.Regexp
+	versionRegex2    *regexp.Regexp
+)
+
+// getVersionRegex returns the compiled version regex patterns
+func getVersionRegex() (*regexp.Regexp, *regexp.Regexp) {
+	versionRegexOnce.Do(func() {
+		versionRegex = regexp.MustCompile(`Python (\d+\.\d+\.\d+)`)
+		versionRegex2 = regexp.MustCompile(`Python (\d+\.\d+\.\d+\S*)`)
+	})
+	return versionRegex, versionRegex2
+}
 
 // PythonConfig manages Python environment configurations
 type PythonConfig struct {
@@ -33,14 +50,12 @@ func NewPythonConfig(configPath string) *PythonConfig {
 	}
 
 	if configPath == "" {
-		// Get AppData path
 		appDataPath := utils.GetAppDataPath()
 		if appDataPath != "" {
 			configDir := filepath.Join(appDataPath, "PythonManager")
-			os.MkdirAll(configDir, 0755) // Create directory if it doesn't exist
+			_ = os.MkdirAll(configDir, 0755)
 			config.configFilePath = filepath.Join(configDir, "python_config.json")
 		} else {
-			// If getting AppData fails, use current directory as fallback
 			config.configFilePath = "python_config.json"
 		}
 	} else {
@@ -85,7 +100,13 @@ func (c *PythonConfig) LoadOrCreateConfig(autoSearch bool) bool {
 
 // parseConfigFile parses the JSON config file
 func (c *PythonConfig) parseConfigFile(filePath string) bool {
-	data, err := ioutil.ReadFile(filePath)
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	data, err := ioutil.ReadAll(file)
 	if err != nil {
 		return false
 	}
@@ -132,7 +153,14 @@ func (c *PythonConfig) saveConfigFile(filePath string) bool {
 		return false
 	}
 
-	return ioutil.WriteFile(filePath, data, 0644) == nil
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	_, err = file.Write(data)
+	return err == nil
 }
 
 // GetPythonVersion gets the Python version from the executable
@@ -145,8 +173,14 @@ func (c *PythonConfig) GetPythonVersion(pythonPath string) string {
 
 	versionOutput := string(output)
 	// Parse version, e.g. from "Python 3.9.7" extract "3.9.7"
-	re := regexp.MustCompile(`Python (\d+\.\d+\.\d+)`)
-	matches := re.FindStringSubmatch(versionOutput)
+	versionRegex, versionRegex2 := getVersionRegex()
+	matches := versionRegex.FindStringSubmatch(versionOutput)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	// Try alternative format "Python 3.9.7+" (with possible revision)
+	matches = versionRegex2.FindStringSubmatch(versionOutput)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -214,95 +248,116 @@ func (c *PythonConfig) findSystemPython() string {
 func (c *PythonConfig) findCondaEnvironments() []string {
 	var condaEnvs []string
 
-	// Check for CONDA_EXE environment variable
 	condaExe := os.Getenv("CONDA_EXE")
 	if condaExe != "" {
-		// Get conda environment list
-		cmd := exec.Command(condaExe, "env", "list")
-		output, err := cmd.Output()
-		if err == nil {
-			lines := strings.Split(string(output), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				// Skip comments and empty lines
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
+		condaEnvs = append(condaEnvs, getCondaEnvListFromExe(condaExe)...)
+	}
 
-				// Skip current environment indicator
-				if line == "*" || strings.HasPrefix(line, "*") {
-					continue
-				}
+	if len(condaEnvs) == 0 {
+		userProfile := os.Getenv("USERPROFILE")
+		if userProfile != "" {
+			condaEnvs = append(condaEnvs, searchMinicondaEnvsWindows(userProfile)...)
+			condaEnvs = append(condaEnvs, searchAnacondaEnvsWindows(userProfile)...)
+		}
+	}
 
-				// Parse environment name and path
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					envName := parts[0]
-					envPath := parts[1]
+	return condaEnvs
+}
 
-					// Skip if envName is the indicator for current env
-					if envName == "*" {
-						continue
-					}
+func getCondaEnvListFromExe(condaExe string) []string {
+	var condaEnvs []string
 
-					// Build Python path
-					pythonPath := filepath.Join(envPath, "python.exe")
-					if fileExists(pythonPath) {
-						condaEnvs = append(condaEnvs, pythonPath)
+	cmd := exec.Command(condaExe, "env", "list")
+	output, err := cmd.Output()
+	if err != nil {
+		return condaEnvs
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if line == "*" || strings.HasPrefix(line, "*") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			envName := parts[0]
+			envPath := parts[1]
+
+			if envName == "*" {
+				continue
+			}
+
+			pythonPath := filepath.Join(envPath, "python.exe")
+			if fileExists(pythonPath) {
+				condaEnvs = append(condaEnvs, pythonPath)
+			}
+		}
+	}
+
+	return condaEnvs
+}
+
+func searchMinicondaEnvsWindows(userProfile string) []string {
+	var condaEnvs []string
+
+	minicondaPath := filepath.Join(userProfile, "Miniconda3")
+	if fileExists(minicondaPath) {
+		pythonPath := filepath.Join(minicondaPath, "python.exe")
+		if fileExists(pythonPath) {
+			condaEnvs = append(condaEnvs, pythonPath)
+		}
+
+		envsDir := filepath.Join(minicondaPath, "envs")
+		if fileExists(envsDir) {
+			file, err := os.Open(envsDir)
+			if err == nil {
+				defer file.Close()
+				entries, err := file.Readdir(-1)
+				if err == nil {
+					for _, entry := range entries {
+						if entry.IsDir() {
+							pythonPath := filepath.Join(envsDir, entry.Name(), "python.exe")
+							if fileExists(pythonPath) {
+								condaEnvs = append(condaEnvs, pythonPath)
+							}
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// If no environments found via environment variable, try common installation paths
-	if len(condaEnvs) == 0 {
-		userProfile := os.Getenv("USERPROFILE")
-		if userProfile != "" {
-			// Miniconda
-			minicondaPath := filepath.Join(userProfile, "Miniconda3")
-			if fileExists(minicondaPath) {
-				pythonPath := filepath.Join(minicondaPath, "python.exe")
-				if fileExists(pythonPath) {
-					condaEnvs = append(condaEnvs, pythonPath)
-				}
+	return condaEnvs
+}
 
-				// Check envs directory
-				envsDir := filepath.Join(minicondaPath, "envs")
-				if fileExists(envsDir) {
-					entries, err := ioutil.ReadDir(envsDir)
-					if err == nil {
-						for _, entry := range entries {
-							if entry.IsDir() {
-								pythonPath := filepath.Join(envsDir, entry.Name(), "python.exe")
-								if fileExists(pythonPath) {
-									condaEnvs = append(condaEnvs, pythonPath)
-								}
-							}
-						}
-					}
-				}
-			}
+func searchAnacondaEnvsWindows(userProfile string) []string {
+	var condaEnvs []string
 
-			// Anaconda
-			anacondaPath := filepath.Join(userProfile, "Anaconda3")
-			if fileExists(anacondaPath) {
-				pythonPath := filepath.Join(anacondaPath, "python.exe")
-				if fileExists(pythonPath) {
-					condaEnvs = append(condaEnvs, pythonPath)
-				}
+	anacondaPath := filepath.Join(userProfile, "Anaconda3")
+	if fileExists(anacondaPath) {
+		pythonPath := filepath.Join(anacondaPath, "python.exe")
+		if fileExists(pythonPath) {
+			condaEnvs = append(condaEnvs, pythonPath)
+		}
 
-				// Check envs directory
-				envsDir := filepath.Join(anacondaPath, "envs")
-				if fileExists(envsDir) {
-					entries, err := ioutil.ReadDir(envsDir)
-					if err == nil {
-						for _, entry := range entries {
-							if entry.IsDir() {
-								pythonPath := filepath.Join(envsDir, entry.Name(), "python.exe")
-								if fileExists(pythonPath) {
-									condaEnvs = append(condaEnvs, pythonPath)
-								}
+		envsDir := filepath.Join(anacondaPath, "envs")
+		if fileExists(envsDir) {
+			file, err := os.Open(envsDir)
+			if err == nil {
+				defer file.Close()
+				entries, err := file.Readdir(-1)
+				if err == nil {
+					for _, entry := range entries {
+						if entry.IsDir() {
+							pythonPath := filepath.Join(envsDir, entry.Name(), "python.exe")
+							if fileExists(pythonPath) {
+								condaEnvs = append(condaEnvs, pythonPath)
 							}
 						}
 					}
@@ -354,13 +409,26 @@ func (c *PythonConfig) findUVEnvironments() []string {
 func (c *PythonConfig) findVenvEnvironments() []string {
 	var venvEnvs []string
 
-	// Find current directory and search parent directories for venv
 	currentPath, _ := os.Getwd()
 	currentPath = filepath.Clean(currentPath)
 
-	// Search up to 5 levels of parent directories
+	venvEnvs = append(venvEnvs, searchVenvInPathTreeWindows(currentPath)...)
+
+	userProfile := os.Getenv("USERPROFILE")
+	if userProfile != "" {
+		venvEnvs = append(venvEnvs, searchVenvInHomeWindows(userProfile)...)
+	}
+
+	venvEnvs = append(venvEnvs, searchVenvInPATH()...)
+	venvEnvs = append(venvEnvs, searchVenvInVirtualEnv()...)
+
+	return venvEnvs
+}
+
+func searchVenvInPathTreeWindows(currentPath string) []string {
+	var venvEnvs []string
+
 	for i := 0; i < 5; i++ {
-		// Check common virtual environment directory names
 		venvNames := []string{"venv", ".venv", "env", ".env"}
 
 		for _, venvName := range venvNames {
@@ -373,46 +441,57 @@ func (c *PythonConfig) findVenvEnvironments() []string {
 			}
 		}
 
-		// Move to parent directory
 		parentPath := filepath.Dir(currentPath)
 		if parentPath == currentPath {
-			// We've reached the root
 			break
 		}
 		currentPath = parentPath
 	}
 
-	// Search user directory for virtual environments
-	userProfile := os.Getenv("USERPROFILE")
-	if userProfile != "" {
-		venvNames := []string{"venv", ".venv", "env", ".env"}
-		for _, venvName := range venvNames {
-			venvPath := filepath.Join(userProfile, venvName)
-			if fileExists(venvPath) {
-				pythonPath := filepath.Join(venvPath, "Scripts", "python.exe")
-				if fileExists(pythonPath) {
-					venvEnvs = append(venvEnvs, pythonPath)
-				}
+	return venvEnvs
+}
+
+func searchVenvInHomeWindows(userProfile string) []string {
+	var venvEnvs []string
+
+	venvNames := []string{"venv", ".venv", "env", ".env"}
+	for _, venvName := range venvNames {
+		venvPath := filepath.Join(userProfile, venvName)
+		if fileExists(venvPath) {
+			pythonPath := filepath.Join(venvPath, "Scripts", "python.exe")
+			if fileExists(pythonPath) {
+				venvEnvs = append(venvEnvs, pythonPath)
 			}
 		}
 	}
 
-	// Check environment variable for virtual environments
+	return venvEnvs
+}
+
+func searchVenvInPATH() []string {
+	var venvEnvs []string
+
 	pathEnv := os.Getenv("PATH")
-	if pathEnv != "" {
-		paths := strings.Split(pathEnv, ";")
-		for _, path := range paths {
-			// Check if it contains Scripts directory
-			if strings.Contains(path, "\\Scripts") {
-				pythonPath := filepath.Join(path, "python.exe")
-				if fileExists(pythonPath) {
-					venvEnvs = append(venvEnvs, pythonPath)
-				}
+	if pathEnv == "" {
+		return venvEnvs
+	}
+
+	paths := strings.Split(pathEnv, ";")
+	for _, path := range paths {
+		if strings.Contains(path, "\\Scripts") {
+			pythonPath := filepath.Join(path, "python.exe")
+			if fileExists(pythonPath) {
+				venvEnvs = append(venvEnvs, pythonPath)
 			}
 		}
 	}
 
-	// Check VIRTUAL_ENV environment variable
+	return venvEnvs
+}
+
+func searchVenvInVirtualEnv() []string {
+	var venvEnvs []string
+
 	virtualEnv := os.Getenv("VIRTUAL_ENV")
 	if virtualEnv != "" {
 		pythonPath := filepath.Join(virtualEnv, "Scripts", "python.exe")
@@ -426,21 +505,34 @@ func (c *PythonConfig) findVenvEnvironments() []string {
 
 // SearchPythonEnvironments searches all available Python environments
 func (c *PythonConfig) SearchPythonEnvironments() {
-	// Cache existing versions to avoid re-running python --version
+	versionCache := c.buildVersionCache()
+
+	c.pythonEnvironments = nil
+	processedPaths := make(map[string]bool)
+
+	addEnvironmentIfUnique := c.createEnvironmentAdder(versionCache, processedPaths)
+
+	addSystemPython(addEnvironmentIfUnique)
+	addCondaEnvironments(addEnvironmentIfUnique)
+	addUVEnvironments(addEnvironmentIfUnique)
+	addVenvEnvironments(addEnvironmentIfUnique)
+	addWSLEnvironments(addEnvironmentIfUnique, processedPaths)
+
+	c.saveConfigFile(c.configFilePath)
+}
+
+func (c *PythonConfig) buildVersionCache() map[string]string {
 	versionCache := make(map[string]string)
 	for _, env := range c.pythonEnvironments {
 		if env.Version != "" {
 			versionCache[env.Path] = env.Version
 		}
 	}
+	return versionCache
+}
 
-	c.pythonEnvironments = nil
-
-	// Used to avoid duplicate paths
-	processedPaths := make(map[string]bool)
-
-	// Helper function to add environment if path is not duplicate
-	addEnvironmentIfUnique := func(name, path string, enabled bool, platform string) {
+func (c *PythonConfig) createEnvironmentAdder(versionCache map[string]string, processedPaths map[string]bool) func(name, path string, enabled bool, platform string) {
+	return func(name, path string, enabled bool, platform string) {
 		if path != "" && !processedPaths[path] {
 			version := versionCache[path]
 			if version == "" {
@@ -460,46 +552,55 @@ func (c *PythonConfig) SearchPythonEnvironments() {
 			processedPaths[path] = true
 		}
 	}
+}
 
-	// Search system Python
-	systemPython := c.findSystemPython()
+func addSystemPython(addEnvironment func(name, path string, enabled bool, platform string)) {
+	systemPython := func() string {
+		cfg := &PythonConfig{}
+		return cfg.findSystemPython()
+	}()
+
 	if systemPython != "" {
-		addEnvironmentIfUnique("system", systemPython, true, "windows") // System Python enabled by default
+		addEnvironment("system", systemPython, true, "windows")
 	}
+}
 
-	// Search Conda environments
-	condaPythons := c.findCondaEnvironments()
+func addCondaEnvironments(addEnvironment func(name, path string, enabled bool, platform string)) {
+	cfg := &PythonConfig{}
+	condaPythons := cfg.findCondaEnvironments()
 	for i, condaPython := range condaPythons {
-		addEnvironmentIfUnique(fmt.Sprintf("conda_%d", i), condaPython, false, "windows") // Conda environments disabled by default
+		addEnvironment(fmt.Sprintf("conda_%d", i), condaPython, false, "windows")
 	}
+}
 
-	// Search UV environments
-	uvPythons := c.findUVEnvironments()
+func addUVEnvironments(addEnvironment func(name, path string, enabled bool, platform string)) {
+	cfg := &PythonConfig{}
+	uvPythons := cfg.findUVEnvironments()
 	for i, uvPython := range uvPythons {
-		addEnvironmentIfUnique(fmt.Sprintf("uv_%d", i), uvPython, false, "windows") // UV environments disabled by default
+		addEnvironment(fmt.Sprintf("uv_%d", i), uvPython, false, "windows")
 	}
+}
 
-	// Search Venv environments
-	venvPythons := c.findVenvEnvironments()
+func addVenvEnvironments(addEnvironment func(name, path string, enabled bool, platform string)) {
+	cfg := &PythonConfig{}
+	venvPythons := cfg.findVenvEnvironments()
 	for i, venvPython := range venvPythons {
-		addEnvironmentIfUnique(fmt.Sprintf("venv_%d", i), venvPython, false, "windows") // Venv environments disabled by default
+		addEnvironment(fmt.Sprintf("venv_%d", i), venvPython, false, "windows")
 	}
+}
 
-	// Search WSL environments
-	wslEnvironments, err := c.SearchWSLEnvironments()
+func addWSLEnvironments(addEnvironment func(name, path string, enabled bool, platform string), processedPaths map[string]bool) {
+	cfg := &PythonConfig{}
+	wslEnvironments, err := cfg.SearchWSLEnvironments()
 	if err == nil {
 		for _, env := range wslEnvironments {
-			// Check if this path is already processed to avoid duplicates
 			if !processedPaths[env.Path] {
 				env.Platform = "wsl"
-				c.pythonEnvironments = append(c.pythonEnvironments, env)
+				cfg.pythonEnvironments = append(cfg.pythonEnvironments, env)
 				processedPaths[env.Path] = true
 			}
 		}
 	}
-
-	// Save search results to config file
-	c.saveConfigFile(c.configFilePath)
 }
 
 // IsWSLAvailable checks if WSL is available and the server is running

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -164,12 +165,20 @@ func (e *PythonExecutor) executeInWSL() int {
 	// Print error if exists
 	if errorStr != "" {
 		fmt.Fprintln(os.Stderr, errorStr)
-		// Limit the error stored in memory
+		// Limit the error stored in memory (reduced to 50 lines and 5KB)
 		lines := strings.Split(errorStr, "\n")
-		if len(lines) > 100 {
-			e.lastError = strings.Join(lines[len(lines)-100:], "\n")
-		} else {
-			e.lastError = errorStr
+		if len(lines) > 50 {
+			lines = lines[len(lines)-50:]
+		}
+		e.lastError = strings.Join(lines, "\n")
+		
+		// Also limit total size to prevent memory issues
+		if len(e.lastError) > 5120 { // 5KB limit
+			e.lastError = e.lastError[len(e.lastError)-5120:]
+			// Find the next newline to avoid cutting in the middle of a line
+			if nextNewline := strings.Index(e.lastError, "\n"); nextNewline != -1 {
+				e.lastError = e.lastError[nextNewline+1:]
+			}
 		}
 	}
 
@@ -184,13 +193,22 @@ func (e *PythonExecutor) captureErrorLine(line string) {
 		return
 	}
 
-	// Split by newline and keep last 100 lines
+	// Split by newline and keep last 50 lines (reduced from 100)
 	lines := strings.Split(e.lastError, "\n")
-	if len(lines) >= 100 {
-		lines = lines[len(lines)-99:]
+	if len(lines) >= 50 {
+		lines = lines[len(lines)-49:]
 	}
 	lines = append(lines, line)
 	e.lastError = strings.Join(lines, "\n")
+	
+	// Also limit total size to prevent memory issues (reduced to 5KB)
+	if len(e.lastError) > 5120 { // 5KB limit
+		e.lastError = e.lastError[len(e.lastError)-5120:]
+		// Find the next newline to avoid cutting in the middle of a line
+		if nextNewline := strings.Index(e.lastError, "\n"); nextNewline != -1 {
+			e.lastError = e.lastError[nextNewline+1:]
+		}
+	}
 }
 
 // collectInputData collects input data from the user for interactive scripts
@@ -282,6 +300,10 @@ func (e *PythonExecutor) executeWithOutputCapture() int {
 		return 1
 	}
 
+	// Create context for goroutine management
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		e.lastError = fmt.Sprintf("Failed to start process: %v", err)
@@ -290,41 +312,62 @@ func (e *PythonExecutor) executeWithOutputCapture() int {
 	}
 
 	// Use channels to signal completion of reading
-	stdoutDone := make(chan bool)
-	stderrDone := make(chan bool)
+	stdoutDone := make(chan bool, 1)
+	stderrDone := make(chan bool, 1)
 
 	// Read stdout in a goroutine
 	go func() {
+		defer func() { stdoutDone <- true }()
 		stdoutScanner := bufio.NewScanner(stdout)
-		for stdoutScanner.Scan() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if !stdoutScanner.Scan() {
+					return
+				}
+			}
 			line := stdoutScanner.Text()
-			// Only capture last few lines of output to avoid memory leak
-			// lastOutput is not currently used by the CLI anyway
-
-			// Directly output to console (already UTF-8 encoded)
 			fmt.Println(line)
 		}
-		stdoutDone <- true
 	}()
 
 	// Read stderr in a goroutine
 	go func() {
+		defer func() { stderrDone <- true }()
 		stderrScanner := bufio.NewScanner(stderr)
-		for stderrScanner.Scan() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if !stderrScanner.Scan() {
+					return
+				}
+			}
 			line := stderrScanner.Text()
 			e.captureErrorLine(line)
-			// Directly output to console (already UTF-8 encoded)
 			fmt.Fprintln(os.Stderr, line)
 		}
-		stderrDone <- true
 	}()
 
 	// Wait for command to finish
 	err = cmd.Wait()
 
-	// Wait for readers to finish
-	<-stdoutDone
-	<-stderrDone
+	// Cancel context to signal goroutines to stop
+	cancel()
+
+	// Wait for readers to finish with timeout
+	select {
+	case <-stdoutDone:
+	case <-time.After(5 * time.Second):
+	}
+
+	select {
+	case <-stderrDone:
+	case <-time.After(5 * time.Second):
+	}
 
 	if err != nil {
 		// Check exit code
